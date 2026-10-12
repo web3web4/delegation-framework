@@ -2,6 +2,7 @@
 pragma solidity 0.8.23;
 
 import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import { IEntryPoint } from "@account-abstraction/interfaces/IEntryPoint.sol";
 
 import { DeleGatorCore } from "./DeleGatorCore.sol";
@@ -20,7 +21,7 @@ struct MultiSigDeleGatorStorage {
  * @title MultiSig Delegator Contract
  * @dev This contract extends the DeleGatorCore contract. It provides functionality for multi-signature based access control and
  * delegation.
- * @dev The signers that control the DeleGator MUST be EOAs
+ * @dev The signers that control the DeleGator can be EOAs or ERC-1271 contracts.
  */
 contract MultiSigDeleGator is DeleGatorCore {
     ////////////////////////////// State //////////////////////////////
@@ -43,6 +44,9 @@ contract MultiSigDeleGator is DeleGatorCore {
 
     /// @dev The length of a signature
     uint256 private constant SIGNATURE_LENGTH = 65;
+
+    /// @dev The length of a contract signature header: signer address (20) + signature length (2)
+    uint256 private constant CONTRACT_SIGNATURE_HEADER_LENGTH = 22;
 
     ////////////////////////////// Events //////////////////////////////
 
@@ -135,7 +139,7 @@ contract MultiSigDeleGator is DeleGatorCore {
      * @param _newSigner The new signer address to replace the old one.
      */
     function replaceSigner(address _oldSigner, address _newSigner) external onlyEntryPointOrSelf {
-        if (_newSigner == address(0) || _newSigner.code.length != 0) revert InvalidSignerAddress();
+        if (_newSigner == address(0) || _newSigner == address(this)) revert InvalidSignerAddress();
 
         MultiSigDeleGatorStorage storage s_ = _getDeleGatorStorage();
 
@@ -160,7 +164,7 @@ contract MultiSigDeleGator is DeleGatorCore {
      * @param _newSigner the new signer to be added
      */
     function addSigner(address _newSigner) external onlyEntryPointOrSelf {
-        if (_newSigner == address(0) || _newSigner.code.length != 0) revert InvalidSignerAddress();
+        if (_newSigner == address(0) || _newSigner == address(this)) revert InvalidSignerAddress();
 
         MultiSigDeleGatorStorage storage s_ = _getDeleGatorStorage();
 
@@ -292,7 +296,7 @@ contract MultiSigDeleGator is DeleGatorCore {
         for (uint256 i = 0; i < signersLength_; ++i) {
             address newSigner_ = _signers[i];
             if (s_.isSigner[newSigner_]) revert AlreadyASigner();
-            if (newSigner_ == address(0) || newSigner_.code.length != 0) revert InvalidSignerAddress();
+            if (newSigner_ == address(0) || newSigner_ == address(this)) revert InvalidSignerAddress();
 
             s_.signers.push(newSigner_);
             s_.isSigner[newSigner_] = true;
@@ -321,35 +325,63 @@ contract MultiSigDeleGator is DeleGatorCore {
     /**
      * @notice This method is used to verify the signatures of the signers
      * @dev Signatures must be sorted in ascending order by the address of the signer.
+     * @dev EOA signer: 65-byte ECDSA signature [r(32)|s(32)|v(1)]
+     * @dev Contract signer: [signer(20)|length(2)|signature(length)], validated with ERC-1271
+     * @dev An entry is a contract signature when its first 20 bytes are the address of a signer that has code at validation time.
+     * The first 20 bytes of an EOA signature are part of the ECDSA `r`, which in practice never equals a signer address.
      * @param _hash The data signed
-     * @param _signatures A threshold amount of 65-byte signatures from the signers all sorted and concatenated
-     * @return The EIP1271 magic value if the signature is valid, otherwise it reverts
+     * @param _signatures Exactly a threshold amount of concatenated signatures, sorted by signer address
+     * @return The EIP1271 magic value if valid, SIG_VALIDATION_FAILED if not.
      */
     function _isValidSignature(bytes32 _hash, bytes calldata _signatures) internal view override returns (bytes4) {
         MultiSigDeleGatorStorage storage s_ = _getDeleGatorStorage();
 
-        // check if we have enough sigs by threshold
-        if (_signatures.length != s_.threshold * SIGNATURE_LENGTH) return ERC1271Lib.SIG_VALIDATION_FAILED;
-
-        uint256 signatureCount_ = _signatures.length / SIGNATURE_LENGTH;
         uint256 threshold_ = s_.threshold;
 
+        uint256 offset_ = 0;
         // There cannot be an owner with address 0.
         address lastOwner_ = address(0);
         address currentOwner_;
         uint256 validSignatureCount_ = 0;
 
-        for (uint256 i = 0; i < signatureCount_; ++i) {
-            bytes memory signature_ = _signatures[i * SIGNATURE_LENGTH:(i + 1) * SIGNATURE_LENGTH];
+        while (offset_ < _signatures.length) {
+            // The smallest entry is a contract signer with an empty signature
+            if (_signatures.length - offset_ < CONTRACT_SIGNATURE_HEADER_LENGTH) return ERC1271Lib.SIG_VALIDATION_FAILED;
 
-            currentOwner_ = ECDSA.recover(_hash, signature_);
+            address potentialSigner_ = address(bytes20(_signatures[offset_:offset_ + 20]));
+
+            // Check isSigner first to avoid EXTCODESIZE on arbitrary addresses (cold access gas, ERC-7562 OP-041)
+            if (s_.isSigner[potentialSigner_] && potentialSigner_.code.length > 0) {
+                offset_ += 20;
+                currentOwner_ = potentialSigner_;
+
+                uint256 sigLength_ = uint256(uint16(bytes2(_signatures[offset_:offset_ + 2])));
+                offset_ += 2;
+
+                if (_signatures.length - offset_ < sigLength_) return ERC1271Lib.SIG_VALIDATION_FAILED;
+                bytes memory contractSig_ = _signatures[offset_:offset_ + sigLength_];
+                offset_ += sigLength_;
+
+                if (!SignatureChecker.isValidERC1271SignatureNow(currentOwner_, _hash, contractSig_)) {
+                    return ERC1271Lib.SIG_VALIDATION_FAILED;
+                }
+            } else {
+                if (_signatures.length - offset_ < SIGNATURE_LENGTH) return ERC1271Lib.SIG_VALIDATION_FAILED;
+                bytes memory signature_ = _signatures[offset_:offset_ + SIGNATURE_LENGTH];
+                offset_ += SIGNATURE_LENGTH;
+
+                ECDSA.RecoverError error_;
+                (currentOwner_, error_,) = ECDSA.tryRecover(_hash, signature_);
+                if (error_ != ECDSA.RecoverError.NoError) return ERC1271Lib.SIG_VALIDATION_FAILED;
+            }
 
             if (currentOwner_ <= lastOwner_ || !s_.isSigner[currentOwner_]) return ERC1271Lib.SIG_VALIDATION_FAILED;
 
             validSignatureCount_++;
 
             if (validSignatureCount_ >= threshold_) {
-                return ERC1271Lib.EIP1271_MAGIC_VALUE;
+                // Extra data after the threshold-th signature is rejected
+                return offset_ == _signatures.length ? ERC1271Lib.EIP1271_MAGIC_VALUE : ERC1271Lib.SIG_VALIDATION_FAILED;
             }
 
             lastOwner_ = currentOwner_;
